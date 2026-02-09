@@ -47,11 +47,17 @@ import time
 # task sleep durations following update run
 HUMIDOR_UPDATE_S = const(1.)
 NETWORK_SLEEP_MS = const(500)
-REPORT_INTERVAL_S = const(2.)
+REPORT_INTERVAL_S = const(10.)
 AVG_LENGTH = const(6*10) # 10 minutes
 
 # gating interval for fan tachometer updates, in ms
 FAN_TACH_GATE_MS = const(2_000)
+# Lower heatsink temp limit where fan is running 100%
+HS_MIN_FAN_RUN = const(45.)
+# Heatsink temperature where heater output is limited
+HS_SETPOINT = const(80.)
+# Heatsink shutdown temperature
+HS_SHUTDOWN = const(85.)
 
 # ==========
 # Handy definitions
@@ -129,12 +135,16 @@ async def main():
     
     # load the control parameters file
     try:
-        temp_setpoint = 24.0
-        out_limits = (0.1, 99.)
+        # regular operating parameters
+        temp_setpoint = 37.0
+        out_limits = (0.1, 100.)
         Kp, Ki, Kd = (500., 0., 0.)
-#         sample_time = HUMIDOR_SLEEP_MS
         last_cmd_pwm = 50.0
-        
+
+        # safety parameters controlling the max heatsink temperature
+        hs_setpoint = HS_SETPOINT
+        Kp_hs, Ki_hs, Kd_hs = (3., 0.5, 0.)
+
     except OSError:
         logit(f"cannot load parameters file, controller will not start")
         
@@ -146,6 +156,12 @@ async def main():
               auto_mode=True,
               starting_output=last_cmd_pwm)
 #     pid.set_auto_mode(True, last_output=starting_output)
+
+    heatsink_pid = PID(Kp_hs, Ki_hs, Kd_hs,
+                       setpoint=hs_setpoint,
+                       output_limits=(0.1, 99.9),
+                       auto_mode=True,
+                       starting_output=out_limits[1])
     
     # current temperature
     temp, _, _ = humidor.update(last_cmd_pwm)
@@ -156,16 +172,37 @@ async def main():
     last_update_time = 0.
     await clock.sleep(HUMIDOR_UPDATE_S)
     
+    safety_trip = False
+    
     while True:
         # check the time and calculate the delta from last update
         current_time = clock.time()
         dt = current_time - last_update_time
+        
+        # manage the heatsink temp by limiting the upper range for
+        #  the heater
+        Ths = humidor.read_heatsink()
+        cmd_upper_limit = heatsink_pid(Ths, dt=dt)
+        
+        # reduce the heater PID's upper limit to keep the heatsink
+        #  below it's setpoint
+        pid.output_limits = (0.1, cmd_upper_limit)
         
         # compute new output from the PID according to the
         #  current temperature
         Tin, RHin = humidor.read_indoor()
         cmd_heat_pwm = pid(Tin, dt=dt)
         
+        # safety check - turn off heat completely at this
+        #  value
+        if (Ths > HS_SHUTDOWN):
+            cmd_heat_pwm = 0
+            safety_trip = True
+        elif safety_trip and (Ths > HS_MIN_FAN_RUN):
+            cmd_heat_pwm = 0
+        else:
+            safety_trip = False
+            
         # feed the control output to the humidor
         #  and get the current temp and settings
         _, act_heat_pwm, fan_pwm = humidor.update(cmd_heat_pwm)
@@ -181,7 +218,8 @@ async def main():
             fan_rpm = 0 if fan_rpm is None else fan_rpm
             
             logit(f"Tset={temp_setpoint:6.2f} C, "
-                  f"Heat={act_heat_pwm:5.1f}%, Fan={fan_pwm:5.1f}%")
+                  f"Heat={act_heat_pwm:5.1f}%, Fan={fan_pwm:5.1f}%, "
+                  f"UL={cmd_upper_limit:5.1f}%")
             logit(f" Tin ={Tin:6.2f} C, RHin ={RHin:5.1f}%")
             logit(f" Tout={Tout:6.2f} C, RHout={RHout:5.1f}%")
             logit(f" Fan={fan_rpm:4.0f} RPM, Ths ={Ths:6.2f} C")
@@ -244,14 +282,14 @@ class Humidor:
         
         try:
             self.bme_inside = BME280(mode=(1,1,1),
-                                     address=BME280_I2CADDR,
+                                     address=BME280_I2CADDR+1,
                                      i2c=self._i2c0)
         except OSError:
             self.bme_inside = None
             
         try:
             self.bme_outside = BME280(mode=(1,1,1),
-                                      address=BME280_I2CADDR+1,
+                                      address=BME280_I2CADDR,
                                       i2c=self._i2c0)
         except OSError:
             self.bme_outside = None
@@ -363,23 +401,30 @@ class Humidor:
         """update the heat and fan settings"""
         
         self.set_heat(heat_pwm)
-        if heat_pwm >= 1.:
+        if heat_pwm >= 10.:
             self.led_heat.on()
         else:
             self.led_heat.off()
             
-        for heat_bkpt, fan_pwm in self._fan_breakpoints:
-#             logit(f"{heat_pwm=}, {heat_bkpt=}, {fan_pwm=}")
-            if heat_pwm <= heat_bkpt:
-                self.set_fan(fan_pwm)
-                break
-        if fan_pwm >= 1.:
+        Ths = self.read_heatsink()
+        if Ths > HS_MIN_FAN_RUN:
+            fan_pwm = 100.
+        else:
+            for heat_bkpt, fan_pwm in self._fan_breakpoints:
+                if heat_pwm <= heat_bkpt:
+                    break
+                
+        self.set_fan(fan_pwm)
+        
+        if fan_pwm >= 10.:
             self.led_fan.on()
         else:
             self.led_fan.off()
-            
+
         temp, _ = self.read_indoor()
         
+#         logit(f"{temp=}, {heat_pwm=}, {fan_pwm=}, {Ths=}")
+
         return temp, heat_pwm, fan_pwm
 
 #
@@ -405,7 +450,7 @@ class PWMCounter:
         self._ctr = PWM_BASE | (0x08 + slice_offset)
         self._div = PWM_BASE | (0x04 + slice_offset)
         self._condition = condition
-#         time.sleep_ms(5)
+        time.sleep_ms(100)
         self.setup(pin)
 
     def setup(self, pin):
@@ -416,6 +461,7 @@ class PWMCounter:
             mem32[0x40039004 + 0x04 * pin] = 0x140
         # Setup PWM counter for selected pin to chosen counter mode
         mem32[self._csr] = self._condition << 4
+        time.sleep_ms(100)
         self.reset()
 
     def start(self):
