@@ -40,6 +40,7 @@ outages = 0
 
 async def messages(client):
     print("started messages")
+    await client.subscribe(TOPIC)
     async for topic, msg, retained in client.queue:
         print("received message")
         print(f'Topic: "{topic.decode()}" Message: "{msg.decode()}" Retained: {retained}')
