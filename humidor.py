@@ -539,11 +539,16 @@ class ClimateController:
         next_update_time = HUMIDOR_UPDATE_S
         last_update_time = 0.
         
+        next_report_time = 0
+        
         current_time = self._clock.time()
         while next_update_time < current_time:
             next_update_time += HUMIDOR_UPDATE_S
         await self._clock.sleep(next_update_time - current_time)
         
+        while next_report_time < current_time:
+            next_report_time += REPORT_INTERVAL_S
+            
         # current temperature
         temp = self._humidor.get_inside_temp()
         self._clock.logit(f"starting temp={temp:5.2f}")
@@ -637,23 +642,30 @@ class ClimateController:
             last_update_time = current_time
             self._last_update_time = last_update_time # record for health check purposes
             
-            upd_Tset = self._setpoint
-            upd_Tin = self._humidor.get_inside_temp()
-            upd_Tout = self._humidor.get_outside_temp()
-            upd_heat = self._humidor.get_heat()
-            upd_fan = self._humidor.get_fan()
-            upd_Ths = self._humidor.get_heatsink()
-            upd_rpm = await self._humidor.get_rpm()
-            
-            self._clock.logit(
-                f"Tset={upd_Tset:5.1f}C, Tin={upd_Tin:5.1f}C,"
-                f" Heat={upd_heat:5.1f}, Fan={upd_fan:5.1f}%, {upd_rpm:4d} RPM,"
-                f" Ths={upd_Ths:5.1f}C, Tout={upd_Tout:5.1f}C"
-            )
+            if current_time > next_report_time:
+                upd_Tset = self._setpoint
+                upd_Tin, upd_Hin = self._humidor.get_inside()
+                upd_Tout, upd_Hout = self._humidor.get_outside()
+                upd_heat = self._humidor.get_heat()
+                upd_fan = self._humidor.get_fan()
+                upd_Ths = self._humidor.get_heatsink()
+                upd_rpm = await self._humidor.get_rpm()
+                
+                msg = (f"Tset={upd_Tset:5.1f}C, Tin={upd_Tin:5.1f}C\n"
+                       f"          Tin= {upd_Tin:5.1f}C, Hin= {upd_Hin:5.1f}%\n"
+                       f"          Tout={upd_Tout:5.1f}C, Hout={upd_Hout:5.1f}%\n"
+                       f"          Heat={upd_heat:5.1f}%, Fan= {upd_fan:5.1f}%, {upd_rpm:4d} RPM, Ths={upd_Ths:5.1f}C"
+                       )
+                self._clock.logit(msg)
+                
+                current_time = self._clock.time()
+                while next_report_time < current_time:
+                    next_report_time += REPORT_INTERVAL_S
+                    
             # calculate the sleep delay and wait for it to elapse
             current_time = self._clock.time() # now we want time from the real "present"
             while next_update_time < current_time:
-                # make sure delay is >0, in case we are running late somehow
+                # make sure delay is >0, in case we are running late
                 next_update_time += HUMIDOR_UPDATE_S
             await self._clock.sleep(next_update_time - current_time + HUMIDOR_UPDATE_OFFSET)
     
