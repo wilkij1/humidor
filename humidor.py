@@ -116,10 +116,11 @@ PIN_SDA0 = const(20)
 PIN_SCL0 = const(21)
 PIN_SDA1 = const(18)
 PIN_SCL1 = const(19)
-PIN_PWM_HEAT = const(27)
+PIN_PWM_HEAT = const(22)
 PIN_PWM_FAN = const(17)
-PIN_LED_HEAT = const(22)
-PIN_LED_FAN = const(26)
+PIN_LED_HEAT = const(10)
+PIN_LED_FAN = const(11)
+PIN_FAN_EN = const(12)
 PIN_FAN_TACH = const(19)
 
 # Error return values
@@ -268,6 +269,11 @@ def startup(humidor_=None):
         humidor = humidor_
         clock.logit("Humidor from main.py")
 
+    # record subsystem status
+    clock.logit(f"{humidor._i2c0=},"
+                f" {humidor.bme_inside=}, {humidor.bme_outside=}")
+    clock.logit(f"{humidor._operational=}")
+    
     try:
         asyncio.run(main(humidor))
         clock.logit("exiting from main()")
@@ -291,7 +297,6 @@ async def main(humidor):
 
 #     # start the tachometer monitor task
 #     tach_mon = FanTachometer(humidor.fan_counter, FAN_TACH_GATE_MS)
-#     tasks.append(tach_mon.monitor_fan())
 #     tach_mon_task = asyncio.create_task(tach_mon.monitor_fan())
 #     tasks.append(tach_mon_task)
     
@@ -634,11 +639,16 @@ class ClimateController:
             
             upd_Tset = self._setpoint
             upd_Tin = self._humidor.get_inside_temp()
+            upd_Tout = self._humidor.get_outside_temp()
             upd_heat = self._humidor.get_heat()
             upd_fan = self._humidor.get_fan()
+            upd_Ths = self._humidor.get_heatsink()
+            upd_rpm = await self._humidor.get_rpm()
+            
             self._clock.logit(
                 f"Tset={upd_Tset:5.1f}C, Tin={upd_Tin:5.1f}C,"
-                f" Heat={upd_heat:5.1f}, Fan={upd_fan:5.1f}%"
+                f" Heat={upd_heat:5.1f}, Fan={upd_fan:5.1f}%, {upd_rpm:4d} RPM,"
+                f" Ths={upd_Ths:5.1f}C, Tout={upd_Tout:5.1f}C"
             )
             # calculate the sleep delay and wait for it to elapse
             current_time = self._clock.time() # now we want time from the real "present"
@@ -711,8 +721,9 @@ class Humidor:
         self.set_heat(0.1)
         
         # fan control
+        self.fan_en = Pin(PIN_FAN_EN, Pin.OUT)
         self.pwm_fan = PWM(PIN_PWM_FAN, freq=25_000, duty_u16=10)
-        self.set_fan(0.1)
+        self.set_fan(0)
         
         try:
             self.bme_inside = BME280(mode=(1,1,1),
@@ -739,8 +750,11 @@ class Humidor:
             (100, 100),
             ]
 
+        Pin(PIN_FAN_TACH, Pin.IN, Pin.PULL_UP)       
         self.fan_counter = PWMCounter(PIN_FAN_TACH, PWMCounter.EDGE_RISING)
-        
+        self.tachometer = FanTachometer(self.fan_counter, FAN_TACH_GATE_MS)
+        self.tach_task = asyncio.create_task(self.tachometer.monitor_fan())
+
         self._operational = (self.bme_inside is not None and self.bme_outside is not None)
             
     def get_conditions(self):
@@ -763,6 +777,9 @@ class Humidor:
     def get_inside_temp(self):
         return self.get_inside()[0]
         
+    def get_outside_temp(self):
+        return self.get_outside()[0]
+    
     def get_inside(self):
         try:
             return self.read_compensated_data(self.bme_inside)
@@ -795,6 +812,7 @@ class Humidor:
         #  thermistor (R2)
         r1 = 1000.
         adc = self._heatsink.read_u16()
+
         # clamp to a range of appx 0C (59577 counts) to 100C (16075)
         adc = min(59577, max(16075, adc))
         reading = adc * 3.3/65535
@@ -802,7 +820,8 @@ class Humidor:
         
         recip_K = steinhart_hart(r2, a, b, c)
         degC = 1/recip_K - 273.15
-        
+
+#         logit(f"{adc=}, {reading=}, {degC=}")
         return degC
     
     def read_internal(self):
@@ -829,6 +848,15 @@ class Humidor:
         return duty_cycle * 100
     
     def set_fan(self, percent):
+        percent = max(0, min(99.9, percent))
+        if percent > 0:
+            self.fan_en.on()
+        else:
+            self.fan_en.off()
+        if percent >= LED_FAN_LOW:
+            self.led_fan.on()
+        else:
+            self.led_fan.off()
         self._set_pwm(self.pwm_fan, percent)
         
     def set_heat(self, percent):
@@ -840,15 +868,13 @@ class Humidor:
         self._set_pwm(self.pwm_heat, percent)
         
     def _set_pwm(self, pwm, percent):
-        percent = max(0.1, min(99.9, percent))
+        percent = max(0, min(99.9, percent))
         duty_cycle = int(655.35*percent)
-        if percent >= LED_FAN_LOW:
-            self.led_fan.on()
-        else:
-            self.led_fan.off()
         pwm.duty_u16(duty_cycle)
         
-
+    def get_rpm(self):
+        return await self.tachometer.read_rpm()
+        
 #
 # PWM counter control from
 #  https://github.com/phoreglad/pico-MP-modules/tree/main/PWMCounter
@@ -918,14 +944,14 @@ class FanTachometer:
         self.counter.set_div()
         self.counter.start()
         
-        self._rpm = None
+        self._rpm = 1
         self._gate = gate  # counting interval in ms
         self._lock = asyncio.Lock()
         
     async def read_rpm(self):
         
         async with self._lock:
-            return self._rpm
+            return 0 if self._rpm is None else self._rpm
         
     async def monitor_fan(self):
         
@@ -938,8 +964,8 @@ class FanTachometer:
                 
                 # tach outputs 2 pulses/revolution. Convert to RPM
                 async with self._lock:
-                    self._rpm = counts/(self._gate/1_000.) * 30
-#                 logit(f"{counts=}, RPM={self._rpm:.0f}")
+                    self._rpm = int(counts/(self._gate/1_000.)*30 + 0.5)
+
         except asyncio.CancelledError:
             self.counter.stop()
             
