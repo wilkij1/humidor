@@ -43,13 +43,14 @@ from bme280_float import (
     BME280_I2CADDR
     )
 import gc
-from hardware import Clock, ConsoleMonitor
+# from hardware import Clock, ConsoleMonitor, StatusMonitor
 import json
 from machine import ADC, I2C, mem32, Pin, PWM, unique_id
 from math import log
 from micropython import const
 from mqtt_as import MQTTClient, config as mqtt_config
 # from mqtt_messages import MQTTMessages
+import os
 from pid import PID
 import re
 import sys
@@ -66,26 +67,27 @@ gc.collect()
 HUMIDOR_UPDATE_S = const(1.)
 HUMIDOR_UPDATE_OFFSET = const(0.)
 NETWORK_SLEEP_MS = const(500)
-REPORT_INTERVAL_S = const(10.)
+REPORT_INTERVAL_S = const(30.)
 REPORT_INTERVAL_OFFSET = const(0.250)
 AVG_LENGTH = const(6*10) # 10 minutes
 MQTT_UPDATE_S = const(2.)
 MQTT_UPDATE_OFFSET = const(0.200)
+CONFIG_SAVE_S = const(60.)
 
 # gating interval for fan tachometer updates, in ms
 FAN_TACH_GATE_MS = const(2_000)
 # Lower heatsink temp limit where fan is running 100%
-HS_MIN_FAN_RUN = const(45.)
+HS_MIN_FAN_RUN = const(55.)
 # Heatsink temperature where heater output is limited
-HS_SETPOINT = const(80.)
+HS_SETPOINT = const(60.)
 # Heatsink shutdown temperature
-HS_SHUTDOWN = const(85.)
+HS_SHUTDOWN = const(65.)
 # trip point to turn on fan indicator
 LED_FAN_LOW = const(10.)
 # trip point to turn on heat indicator
 LED_HEAT_LOW = const(10.)
 # low fan speed (1% value is about 1/2 rotational speed)
-FAN_LOW_PWM = const(1.)
+FAN_LOW_PWM = const(12.)
 # medium fan speed
 FAN_MED_PWM = const(50.)
 # high fan speed
@@ -103,6 +105,9 @@ MAX_SETPOINT = const(50)
 #  update these values so that the change persists when power is
 #  cycled
 FN_CONTROL = "control.json"
+# previous control param file renamed to this prior to writing 
+#  update to FN_CONTROL
+FN_CONTROL_BAK = "control.BAK.json"
 
 # logging file. Names are shuffled on every powerup and
 #  oldest one deleted if more than 5
@@ -130,10 +135,14 @@ HUMID_ERROR = const(0.)
 # ==========
 # G L O B A L S
 # ==========
-clock = Clock(debug=True)
+
+stat_mon = None
 
 def logit(message):
-    clock.logit(message)
+    if stat_mon:
+        stat_mon.clock.logit(message)
+    else:
+        print(message)
     
 class MQTTMessages:
     
@@ -150,22 +159,27 @@ class MQTTMessages:
                 "topic":"humidor/available",
                 },
             "modes": ["off", "auto", "fan_only"],
-            "mode_state_topic": "humidor/state/mode",
+            "mode_state_topic": "humidor/status",
+            "mode_state_template": "{{ value_json.mode }}",
             "mode_command_topic": "humidor/set/mode",
-#             "mode_state_template": "{{ value_json.mode }}",
+
             "fan_modes": ["auto", "low", "medium", "high"],
-            "fan_mode_state_topic": "humidor/state/fan_mode",
+            "fan_mode_state_topic": "humidor/status",
+            "fan_mode_state_template": "{{ value_json.fan_mode }}",
             "fan_mode_command_topic": "humidor/set/fan_mode",
-#             "fan_mode_state_template": "{{ value_json.fan_mode }}",
-            "current_temperature_topic": "humidor/current",
+            "fan_mode_state_template": "{{ value_json.fan_mode }}",
+            
+            "current_temperature_topic": "humidor/status",
             "current_temperature_template": "{{ value_json.in_temp }}",
-            "current_humidity_topic": "humidor/current",
+            "current_humidity_topic": "humidor/status",
             "current_humidity_template": "{{ value_json.in_humid }}",
+            
+            "temperature_state_topic": "humidor/status",
+            "temperature_state_template": "{{ value_json.setpoint }}",
             "temperature_command_topic": "humidor/set/setpoint",
-            "temperature_state_topic": "humidor/state/setpoint",
-#             "temperature_state_template": "{{ value_json.setpoint }}",
+
             "temperature_unit": "C",
-            "temp_step": 0.5,
+            "temp_step": 1.,
             "initial": 4,
             "min_temp": -10,
             "max_temp": 50,
@@ -180,54 +194,79 @@ class MQTTMessages:
                 "suggested_area": "porch",
                 },
             }),
-        ("homeassistant/sensor/HumidorHeatsinkT/config", {
+        ("homeassistant/sensor/HumidorInsideT/config", {
             "device_class": "temperature",
-            "name": "Heatsink Temperature",
-            "state_topic": "humidor/state/current",
+            "name": "T Inside",
+            "state_topic": "humidor/status",
             "unit_of_measurement": "degC",
-            "value_template": "{{ value_json.hs_temp | round(1) }}",
-            "unique_id": "heatsink_temp"+usfx,
+            "value_template": "{{ value_json.in_temp }}",
+            "unique_id": "inside_temp"+usfx,
+            "device": { "ids": identifiers },
+            }),
+        ("homeassistant/sensor/HumidorInsideH/config", {
+            "device_class": "humidity",
+            "name": "RH Inside",
+            "state_topic": "humidor/status",
+            "unit_of_measurement": "%",
+            "value_template": "{{ value_json.in_humid }}",
+            "unique_id": "inside_humidity"+usfx,
             "device": { "ids": identifiers },
             }),
         ("homeassistant/sensor/HumidorOutsideT/config", {
             "device_class": "temperature",
-            "name": "Outside Temperature",
-            "state_topic": "humidor/state/current",
+            "name": "T Outside",
+            "state_topic": "humidor/status",
             "unit_of_measurement": "degC",
-            "value_template": "{{ value_json.out_temp | round(1) }}",
+            "value_template": "{{ value_json.out_temp }}",
             "unique_id": "outside_temp"+usfx,
             "device": { "ids": identifiers },
             }),
         ("homeassistant/sensor/HumidorOutsideH/config", {
             "device_class": "humidity",
-            "name": "Outside Humidity",
-            "state_topic": "humidor/state/current",
+            "name": "RH Outside",
+            "state_topic": "humidor/status",
             "unit_of_measurement": "%",
-            "value_template": "{{ value_json.out_humid | round(1) }}",
+            "value_template": "{{ value_json.out_humid }}",
             "unique_id": "outside_humidity"+usfx,
-            "device": { "ids": identifiers },
-            }),
-        ("homeassistant/sensor/HumidorFanPWM/config", {
-            "name": "Fan PWM",
-            "state_topic": "humidor/state/current",
-            "um": "%",
-            "value_template": "{{ value_json.fan_pwm | round(1) }}",
-            "unique_id": "fan_pwm"+usfx,
             "device": { "ids": identifiers },
             }),
         ("homeassistant/sensor/HumidorHeatPWM/config", {
             "name": "Heat PWM",
-            "state_topic": "humidor/state/current",
+            "state_topic": "humidor/status",
             "um": "%",
-            "value_template": "{{ value_json.heat_pwm | round(1) }}",
+            "value_template": "{{ value_json.heat_pwm }}",
             "unique_id": "heat_pwm"+usfx,
             "device": { "ids": identifiers },
             }),
-        ("homeassistant/sensor/HumidorHeatUL/config", {
-            "name": "Heat Upper Limit",
-            "state_topic": "humidor/state/current",
+        ("homeassistant/sensor/HumidorHeatsinkT/config", {
+            "device_class": "temperature",
+            "name": "T Heatsink",
+            "state_topic": "humidor/status",
+            "unit_of_measurement": "degC",
+            "value_template": "{{ value_json.heatsink_temp }}",
+            "unique_id": "heatsink_temp"+usfx,
+            "device": { "ids": identifiers },
+            }),
+        ("homeassistant/sensor/HumidorFanPWM/config", {
+            "name": "Fan PWM",
+            "state_topic": "humidor/status",
             "um": "%",
-            "value_template": "{{ value_json.heat_upper_limit_pwm | round(1) }}",
+            "value_template": "{{ value_json.fan_pwm }}",
+            "unique_id": "fan_pwm"+usfx,
+            "device": { "ids": identifiers },
+            }),
+        ("homeassistant/sensor/HumidorFanRPM/config", {
+            "name": "Fan RPM",
+            "state_topic": "humidor/status",
+            "value_template": "{{ value_json.fan_rpm }}",
+            "unique_id": "fan_rpm"+usfx,
+            "device": { "ids": identifiers },
+            }),
+        ("homeassistant/sensor/HumidorHeatUL/config", {
+            "name": "Heat UL",
+            "state_topic": "humidor/status",
+            "um": "%",
+            "value_template": "{{ value_json.heat_upper_limit_pwm }}",
             "unique_id": "heat_upper_limit"+usfx,
             "device": { "ids": identifiers },
             }),
@@ -260,22 +299,17 @@ class MQTTMessages:
         return disc_messages
 
 
-def startup(humidor_=None):
-    
-    if humidor_ is None:
-        humidor = Humidor(clock)
-        clock.logit("Humidor initialized")
-    else:
-        humidor = humidor_
-        clock.logit("Humidor from main.py")
+def startup():
 
-    # record subsystem status
-    clock.logit(f"{humidor._i2c0=},"
-                f" {humidor.bme_inside=}, {humidor.bme_outside=}")
-    clock.logit(f"{humidor._operational=}")
+    global stat_mon
+    
+    stat_mon = StatusMonitor()
+
+    clock = Clock(debug=True)
+    stat_mon.register("clock", clock)
     
     try:
-        asyncio.run(main(humidor))
+        asyncio.run(main(stat_mon))
         clock.logit("exiting from main()")
     except KeyboardInterrupt:
         clock.logit("KeyboardInterrupt intercepted and being re-raised")
@@ -286,43 +320,38 @@ def startup(humidor_=None):
     return humidor
 
 
-async def main(humidor):
+async def main(stat_mon):
     
     global tasks
         
     tasks = []
-    
-    # start the network interface task
-    pass
 
-#     # start the tachometer monitor task
-#     tach_mon = FanTachometer(humidor.fan_counter, FAN_TACH_GATE_MS)
-#     tach_mon_task = asyncio.create_task(tach_mon.monitor_fan())
-#     tasks.append(tach_mon_task)
+    humidor = Humidor(stat_mon)
     
     # Humidor Climate Control
-    controller = ClimateController(clock, humidor)
-    tasks.append(controller.control())
-#     controller_task = asyncio.create_task(controller.control())
-#     tasks.append(controller_task)
+    controller = ClimateController(stat_mon)
 
     # local logging
-    consol_mon = ConsoleMonitor(clock, humidor, controller, REPORT_INTERVAL_S, REPORT_INTERVAL_OFFSET)
-    tasks.append(consol_mon.monitor())
+    consol_mon = ConsoleMonitor(stat_mon, REPORT_INTERVAL_S, REPORT_INTERVAL_OFFSET)
   
     # MQTT I/O remote control communication
-    mqtt_mon = MQTTMonitor(clock, humidor, controller)
-    tasks.append(mqtt_mon.monitor())
+    mqtt_mon = MQTTMonitor(stat_mon)
+
+    # start the async tasks
+    tasks.append( asyncio.create_task(controller.control()) )
+    tasks.append( asyncio.create_task(controller.maintain_configuration()) )
+    tasks.append( asyncio.create_task(consol_mon.monitor()) )
+    tasks.append( asyncio.create_task(mqtt_mon.monitor()) )
     
     await asyncio.gather(*tasks)
     
 
 class MQTTMonitor():
     
-    def __init__(self, clock, humidor, controller):
-        self._clock = clock
-        self._humidor = humidor
-        self._controller = controller
+    def __init__(self, stat_mon):
+        self._sm = stat_mon
+        self._sm.register("mqtt_monitor", self)
+        
         self.unique_id = hexlify(unique_id())
         
         self.subscriptions = [
@@ -345,7 +374,7 @@ class MQTTMonitor():
         self._mqm = MQTTMessages()
         
         self.client = MQTTClient(self.config)
-        self.client.DEBUG = True
+        self.client.DEBUG = False
         self.outages = 0
         self._is_connected = False
         
@@ -371,60 +400,37 @@ class MQTTMonitor():
         self._is_connected = True
             
         n = 0
+        clock = self._sm.clock
         next_data_update_time = MQTT_UPDATE_S
-        current_time = self._clock.time()
+        current_time = clock.time()
         while next_data_update_time < current_time:
             next_data_update_time += MQTT_UPDATE_S
-        await self._clock.sleep(next_data_update_time - current_time)
+        await clock.sleep(next_data_update_time - current_time)
         
         while True:
-            Tset = self._controller.setpoint
-            (Tin, RHin, Tout, RHout, Ths) = self._humidor.get_conditions()
-            heat_pwm, fan_pwm = self._humidor.get_heat(), self._humidor.get_fan()
+            await self.publish_state()
             
-#             Tinside_lo_sp, Tinside_hi_sp, Tinside_alarm =\
-#                 self.controller.get_setpoint("Tinside_lo_sp Tinside_hi_sp Tinside_alarm".split())
-#             
-#             Tinside_alarm = (Tinside_lo_sp < Tin < Tinside_hi_sp)
-
-            msg = json.dumps({
-                "mode": "auto",
-                "fan_mode": "auto",
-                "setpoint": Tset,
-                "in_temp": Tin,
-                "in_humid": RHin,
-                "out_temp": Tout,
-                "out_humid": RHout,
-                "hs_temp": Ths,
-                "heat_pwm": heat_pwm,
-                # "heat_upper_limit": heat_ul,
-                "fan_pwm": fan_pwm,
-                "fan_rpm": 0.,
-#                 "inside_temperature_alarm": "on" if self.Tinside_alarm else "off",
-#                 "inside_humidity_alarm": "off",
-#                 "inside_temperature_lo_sp": self.Tinside_alarm_lo_sp,
-#                 "inside_temperature_hi_sp": self.Tinside_alarm_hi_sp,
-                })
-            
-            # If WiFi is down the following will pause for the duration.
-            await self.client.publish("humidor/current", msg, retain=True, qos=0)
-
-            current_time = self._clock.time()
+            current_time = clock.time()
             while next_data_update_time < current_time:
                 next_data_update_time += MQTT_UPDATE_S
-            await self._clock.sleep(next_data_update_time - current_time + MQTT_UPDATE_OFFSET)
+            await clock.sleep(next_data_update_time - current_time + MQTT_UPDATE_OFFSET)
             
             n += 1
     
     async def messages(self):
+        clock = self._sm.clock
+        controller = self._sm.controller
+        
         async for topic, msg, retained in self.client.queue:
+            clock.logit(f"{topic=}, {msg=}, {retained=}")
             dtopic = topic.decode()
             try:
                 dmsg = json.loads(msg.decode())
+                clock.logit(f" json: {dtopic=}, {dmsg=}")
             except ValueError:
                 dmsg = msg.decode()
+                clock.logit(f"!json: {dtopic=}, {dmsg=}")
                 
-            self._clock.logit(f"rx: {dtopic}, {retained}, {dmsg=}, {type(dmsg)=}")
             # try:
                 # rx_msg = json.loads(msg.decode())
                 # self._clock.logit(f"rx: {rx_msg=}")
@@ -433,21 +439,14 @@ class MQTTMonitor():
                 # continue
 
             if dtopic == "humidor/set/mode":
-                self._controller.mode = dmsg
-                await self.client.publish("humidor/state/mode", dmsg, True, 1)
+                controller.mode = dmsg
+                await self.publish_state()
             elif dtopic == "humidor/set/fan_mode":
-                self._controller.fan_mode = dmsg
-                await self.client.publish("humidor/state/mode", dmsg, True, 1)
+                controller.fan_mode = dmsg
+                await self.publish_state()
             elif dtopic == "humidor/set/setpoint":
-                self._controller.setpoint = float(dmsg)
-                await self.client.publish("humidor/state/setpoint", str(dmsg), True, 1)
-            # if dtopic == self.topics["ha_status"] and dmsg == "online":
-                # await clock.sleep(0.25)	# just to provide HA some breathing room
-                # await self.client.publish(
-                    # self.topics['discovery'],
-                    # json.dumps(self.discovery_payload),
-                    # retain=True, qos=1)
-                # continue
+                controller.setpoint = float(dmsg)
+                await self.publish_state()
             
 
     async def down(self):
@@ -457,17 +456,16 @@ class MQTTMonitor():
             self.client.down.clear()
             # wifi_led(False)
             self.outages += 1
-            self._clock.logit("WiFi or MQTT broker is down.")
+            logit("WiFi or MQTT broker is down.")
 
     async def up(self):
         while True:
             await self.client.up.wait()
             self._is_connected = True
             self.client.up.clear()
-            # wifi_led(True)
                 
             # publish the discovery messages
-            self._clock.logit("publishing HA configuration")
+            logit("publishing HA configuration")
             for topic, message in self._mqm.discovery_messages():
                 await self.client.publish(topic, message, retain=True, qos=0)
                 
@@ -482,76 +480,161 @@ class MQTTMonitor():
 
     async def publish_state(self):
         
-        state_messages = [
-            ("humidor/state/mode", self._controller.mode),
-            ("humidor/state/fan_mode", self._controller.fan_mode),
-            ("humidor/state/setpoint", self._controller.setpoint),
-            ]
+#             Tset = self._controller.setpoint
+#             (Tin, RHin, Tout, RHout, Ths) = self._humidor.get_conditions()
+#             heat_pwm, fan_pwm = self._humidor.get_heat(), self._humidor.get_fan()
             
-        for topic, message in state_messages:
-            await self.client.publish(topic, json.dumps(message), retain=True, qos=1)
-   
+#             Tinside_lo_sp, Tinside_hi_sp, Tinside_alarm =\
+#                 self.controller.get_setpoint("Tinside_lo_sp Tinside_hi_sp Tinside_alarm".split())
+#             
+#             Tinside_alarm = (Tinside_lo_sp < Tin < Tinside_hi_sp)
+
+            status = await self._sm.status(True)
+            msg = json.dumps(status)
+            
+            # If WiFi is down the following will pause for the duration.
+            await self.client.publish("humidor/status", msg, retain=False, qos=0)
+            for kk in sorted(status.keys()):
+                await self.client.publish(f"humidor/status/{kk}", json.dumps(status[kk]), retain=False, qos=0)
+
 class ClimateController:
+
+    defaults = dict(
+        mode="off", fan_mode="auto", setpoint=25.,
+        heat_upper_limit_pwm=100.,
+        Kp=const(500.), Ki=const(0.), Kd=const(0.),
+        hs_setpoint=const(HS_SETPOINT),
+        Kp_hs=const(3.), Ki_hs=const(0.5), Kd_hs=const(0.),
+    )
     
-    def __init__(self, clock, humidor):
-        self._mode = "auto"
-        self._fan_mode = "auto"
-        self._clock = clock
-        self._humidor = humidor
-        self._cmd_upper_limit = 99.9
+    def __init__(self, stat_mon):
+        self._sm = stat_mon
+        self._sm.register("controller", self)
+        
+        self._config_event = asyncio.Event()
+        
         self._last_update_time = None
         
-        # load the control parameters file
-        try:
-            # regular operating parameters
-            self._setpoint = 21.5
-            self.heat_limits = (0.1, 100.)
-            self.Kp, self.Ki, self.Kd = (500., 0., 0.)
-            self.last_cmd_pwm = 50.0
+        # load the control parameters file, if possible...
+        startup = self.load_configuration()
+                    
+        # unpack the operating parameters
+        self._mode = startup["mode"]
+        self._fan_mode = startup["fan_mode"]
+        self._setpoint = startup["setpoint"]
+        self._heat_upper_limit_pwm = startup["heat_upper_limit_pwm"]
+        self._Kp, self._Ki, self._Kd = startup["Kp"], startup["Ki"], startup["Kd"]
 
-            # safety parameters controlling the max heatsink temperature
-            self._hs_setpoint = HS_SETPOINT
-            self.Kp_hs, self.Ki_hs, self.Kd_hs = (3., 0.5, 0.)
+        # safety parameters controlling the max heatsink temperature
+        self._hs_setpoint = startup["hs_setpoint"]
+        self._Kp_hs, self._Ki_hs, self._Kd_hs = startup["Kp_hs"], startup["Ki_hs"], startup["Kd_hs"]
 
-        except OSError:
-            logit(f"cannot load parameters file, controller will not start")
-            self._operational = False
-            
+        self._operational = True
+        
         # start the PID controller task
-        self.pid = PID(self.Kp, self.Ki, self.Kd,
+        self.pid = PID(self._Kp, self._Ki, self._Kd,
                        setpoint=self._setpoint,
-                       output_limits=self.heat_limits,
+                       output_limits=(0., self._heat_upper_limit_pwm),
                        auto_mode=True,
-                       starting_output=self.last_cmd_pwm)
+                       starting_output=0.)
 
-        self.heatsink_pid = PID(self.Kp_hs, self.Ki_hs, self.Kd_hs,
+        self.heatsink_pid = PID(self._Kp_hs, self._Ki_hs, self._Kd_hs,
                                 setpoint=self._hs_setpoint,
-                                output_limits=(0.1, 99.9),
+                                output_limits=(0., 100.),
                                 auto_mode=True,
-                                starting_output=self.heat_limits[1])
+                                starting_output=self._heat_upper_limit_pwm)
         
         self.fan_pwms = dict(low=FAN_LOW_PWM, medium=FAN_MED_PWM, high=FAN_HIGH_PWM)
         
         self._operational = True
 
+    def load_configuration(self):
+        
+        startup = None
+        
+        for fn in (FN_CONTROL, FN_CONTROL_BAK):
+            try:
+                with open(fn, "r") as fh:
+                    startup = json.load(fh)
+                logit(f"loaded configuration from '{fn}'")
+                break
+            except (OSError, ValueError):
+                pass
+                
+        if startup and fn == FN_CONTROL_BAK:
+            # good load from backup, shuffle the files
+            os.remove(FN_CONTROL)
+            os.rename(FN_CONTROL_BAK, FN_CONTROL)
+            os.sync()
+            
+        if startup:
+            return startup
+        
+        logit(f"fallback to default configuration parameters")
+        return self.defaults
+    
+    def save_configuration(self):
+        self._config_event.set()
+        
+    async def write_configuration(self):
+        
+        startup = await self._sm.status(True)
+        
+        # remove any existing backup file...
+        try:
+            os.remove(FN_CONTROL_BAK)
+        except OSError:
+            pass
+
+        # rename the existing file, if any, as the backup (and sync)
+        try:
+            os.rename(FN_CONTROL, FN_CONTROL_BAK)
+            os.sync()
+        except OSError:
+            logit(f"error creating backup configuration file, continuing...")
+            pass
+            
+        try:
+            with open(FN_CONTROL, "w") as fho:
+                json.dump(startup, fho)
+            os.sync()
+        except OSError:
+            self._cm.clock.logit(f"error saving configuration file to '{FN_CONTROL}'")
+            pass
+            
+    async def maintain_configuration(self):
+        
+        next_save_time = CONFIG_SAVE_S
+        clock = self._sm.clock
+        
+        while True:
+            current_time = clock.time()
+            while next_save_time < current_time:
+                next_save_time += CONFIG_SAVE_S
+
+            try:
+                await asyncio.wait_for(self._config_event.wait(), timeout=next_save_time - current_time)
+                self._config_event.clear()
+            except asyncio.TimeoutError:
+                pass
+                
+            await self.write_configuration()
+            
     async def control(self):
         
         next_update_time = HUMIDOR_UPDATE_S
         last_update_time = 0.
         
-        next_report_time = 0
-        
-        current_time = self._clock.time()
+        clock = self._sm.clock
+        current_time = clock.time()
         while next_update_time < current_time:
             next_update_time += HUMIDOR_UPDATE_S
-        await self._clock.sleep(next_update_time - current_time)
+        await clock.sleep(next_update_time - current_time)
         
-        while next_report_time < current_time:
-            next_report_time += REPORT_INTERVAL_S
-            
         # current temperature
-        temp = self._humidor.get_inside_temp()
-        self._clock.logit(f"starting temp={temp:5.2f}")
+        humidor = self._sm.humidor
+        temp = humidor.get_inside_temp()
+        clock.logit(f"starting temp={temp:5.2f}")
         
         safety_trip = False
         
@@ -560,8 +643,11 @@ class ClimateController:
             # check the time and calculate the delta from last update,
             #  for the benefit of the PID controllers
             # ==========
-            current_time = self._clock.time()
+            current_time = clock.time()
             dt = current_time - last_update_time
+            
+            # read the current heatsink temperature
+            Ths = humidor.get_heatsink()
             
             if self._mode == "auto":
                 # ==========
@@ -573,17 +659,15 @@ class ClimateController:
                 #  shut off power to the heater completely until it gets to
                 #  the low safety limit
                 # ==========
-                # read heatsink temp and calculate a new upper limit
-                Ths = self._humidor.get_heatsink()
-                cmd_upper_limit = self.heatsink_pid(Ths, dt=dt)
-                self._cmd_upper_limit = cmd_upper_limit
+                # calculate new upper limit heat control limit, based on HS temperature
+                self._heat_upper_limit_pwm = self.heatsink_pid(Ths, dt=dt)
                 # set the heater PID's upper limit to keep the heatsink temp
                 #  below it's max desired temperature
-                self.pid.output_limits = (0.1, cmd_upper_limit)
+                self.pid.output_limits = (0., self._heat_upper_limit_pwm)
                 
                 # compute new output from the PID according to the
                 #  current temperature
-                Tin, RHin = self._humidor.get_inside()
+                Tin, RHin = humidor.get_inside()
                 cmd_heat_pwm = self.pid(Tin, dt=dt)
                 
                 # safety check - turn off heat completely at this
@@ -596,41 +680,26 @@ class ClimateController:
                 else:
                     safety_trip = False
                     
-                # feed the control output to the humidor
-                #  and get the current temp and settings
-                self._humidor.set_heat(cmd_heat_pwm)
-                
-                # ==========
-                # set the fan speed according to the current fan mode
-                # ==========
-                if self._fan_mode == "auto":
-                    # fan speed depends on the heat_pwm value
-                    if Ths > HS_MIN_FAN_RUN:
-                        fan_pwm = 100.
-                    else:
-                        for heat_bkpt, fan_pwm in self._humidor._fan_breakpoints:
-                            if cmd_heat_pwm <= heat_bkpt:
-                                break
-                            
-                    self._humidor.set_fan(fan_pwm)
-                    
-                else:
-                    # hot heatsink will override a manual fan mode
-                    if Ths > HS_MIN_FAN_RUN:
-                        self._humidor.set_fan(FAN_HIGH_PWM)
-                    else:
-                        self._humidor.set_fan(self.fan_pwms.get(self.fan_mode, FAN_HIGH_PWM))
-                    
             elif self._mode == "fan_only":
-                # run the fan at a commanded speed with the heat turned off                    
-                self._humidor.set_fan(self.fan_pwms.get(self.fan_mode, FAN_HIGH_PWM))
-                self._humidor.set_heat(0)
+                # run the fan at a commanded speed with the heat turned off
+                cmd_heat_pwm = 0
                 
             else:
                 # turn everything off
-                self._humidor.set_heat(0)
-                self._humidor.set_fan(0)
-                
+                cmd_heat_pwm = 0
+            
+            # ==========
+            # calculate the fan setting, based on mode, fan_mode, 
+            #  heat commanded and HS temperature
+            # ==========
+            cmd_fan_pwm = self._compute_fan_pwm(cmd_heat_pwm, Ths)
+ 
+            # ==========
+            # update the commanded heat and fan settings
+            # ==========
+            humidor.set_heat(cmd_heat_pwm)
+            humidor.set_fan(cmd_fan_pwm)
+            
             # preemptively run the garbage collector to
             #  avoid long pauses at inopportune times
             gc.collect()
@@ -642,39 +711,53 @@ class ClimateController:
             last_update_time = current_time
             self._last_update_time = last_update_time # record for health check purposes
             
-            if current_time > next_report_time:
-                upd_Tset = self._setpoint
-                upd_Tin, upd_Hin = self._humidor.get_inside()
-                upd_Tout, upd_Hout = self._humidor.get_outside()
-                upd_heat = self._humidor.get_heat()
-                upd_fan = self._humidor.get_fan()
-                upd_Ths = self._humidor.get_heatsink()
-                upd_rpm = await self._humidor.get_rpm()
-                
-                msg = (f"Tset={upd_Tset:5.1f}C, Tin={upd_Tin:5.1f}C\n"
-                       f"          Tin= {upd_Tin:5.1f}C, Hin= {upd_Hin:5.1f}%\n"
-                       f"          Tout={upd_Tout:5.1f}C, Hout={upd_Hout:5.1f}%\n"
-                       f"          Heat={upd_heat:5.1f}%, Fan= {upd_fan:5.1f}%, {upd_rpm:4d} RPM, Ths={upd_Ths:5.1f}C"
-                       )
-                self._clock.logit(msg)
-                
-                current_time = self._clock.time()
-                while next_report_time < current_time:
-                    next_report_time += REPORT_INTERVAL_S
-                    
             # calculate the sleep delay and wait for it to elapse
-            current_time = self._clock.time() # now we want time from the real "present"
+            current_time = clock.time() # now we want time from the real "present"
             while next_update_time < current_time:
                 # make sure delay is >0, in case we are running late
                 next_update_time += HUMIDOR_UPDATE_S
-            await self._clock.sleep(next_update_time - current_time + HUMIDOR_UPDATE_OFFSET)
+            await clock.sleep(next_update_time - current_time + HUMIDOR_UPDATE_OFFSET)
     
+    def _compute_fan_pwm(self, cmd_heat_pwm, Ths):
+        
+        # hot heatsink always forces high speed fan
+        min_fan_pwm = 0.
+        
+        if Ths > HS_MIN_FAN_RUN:
+            cmd_fan_pwm = FAN_HIGH_PWM
+        
+        elif self.mode == "auto":
+            # calculate the minimum fan speed, based on the heat command
+            for heat_bkpt, min_fan_pwm in self._sm.humidor._fan_breakpoints:
+                if cmd_heat_pwm <= heat_bkpt:
+                    break
+            
+            if self.fan_mode == "auto":
+                cmd_fan_pwm = min_fan_pwm
+            else:
+                fan_mode_pwm = self.fan_pwms.get(self.fan_mode, FAN_HIGH_PWM)
+                cmd_fan_pwm = max(min_fan_pwm, fan_mode_pwm)
+                
+        elif self.mode == "fan_only":
+            if self.fan_mode == "auto":
+                cmd_fan_pwm = FAN_LOW_PWM
+            else:
+                cmd_fan_pwm = self.fan_pwms.get(self.fan_mode, FAN_HIGH_PWM)
+        else: # mode is "off"
+            cmd_fan_pwm = 0.
+
+#         self._clock.logit(f"CFP: {(self.mode, self.fan_mode, min_fan_pwm, cmd_fan_pwm)=}")
+        return cmd_fan_pwm
+        
     @property
     def mode(self): return self._mode
     @mode.setter
     def mode(self, mode):
         if mode in "auto fan_only off".split():
+            old_mode = self._mode
             self._mode = mode
+            if mode != old_mode:
+                self.save_configuration()
         else:
             raise ValueError(f"mode must be 'auto', 'fan_only' or 'off', received '{mode}'")
             
@@ -683,7 +766,10 @@ class ClimateController:
     @fan_mode.setter
     def fan_mode(self, fan_mode):
         if fan_mode in "auto low medium high".split():
+            old_fan_mode = self._fan_mode
             self._fan_mode = fan_mode
+            if fan_mode != old_fan_mode:
+                self.save_configuration()
         else:
             raise ValueError(f"fan mode must be 'auto', 'low', 'medium' or 'high', received '{fan_mode}'")
     
@@ -692,8 +778,11 @@ class ClimateController:
     @setpoint.setter
     def setpoint(self, setpoint):
         if MIN_SETPOINT <= setpoint <= MAX_SETPOINT:
+            old_setpoint = self._setpoint
             self._setpoint = setpoint
             self.pid.setpoint = setpoint
+            if setpoint != old_setpoint:
+                self.save_configuration()
         else:
             raise ValueError(f"setpoint must be in range [{MIN_SETPOINT}, {MAX_SETPOINT}], received {setpoint}")
             
@@ -703,20 +792,29 @@ class ClimateController:
     @hs_setpoint.setter
     def hs_setpoint(self, hs_setpoint):
         if MIN_HS_SETPOINT <= hs_setpoint <= MAX_HS_SETPOINT:
+            old_hs_setpoint = self._hs_setpoint
             self._hs_setpoint = hs_setpoint
             self.heatsink_pid.setpoint = hs_setpoint
+            if hs_setpoint != old_hs_setpoint:
+                self.save_configuration()
         else:
             raise ValueError(f"heatsink setpoint must be in range [{MIN_HS_SETPOINT}, {MAX_HS_SETPOINT}], received {hs_setpoint}")
             
+    @property
+    def heat_upper_limit_pwm(self):
+        return self._heat_upper_limit_pwm
+        
     def get_status(self):
-        return (self._setpoint, self._cmd_upper_limit, self._last_update_time)
+        return (self._setpoint, self._heat_upper_limit_pwm, self._last_update_time)
 
 
 class Humidor:
     
-    def __init__(self, clock):
+    def __init__(self, stat_mon):
         
-        self._clock = clock
+        self._sm = stat_mon
+        self._sm.register("humidor", self)
+        
         self.debug = True
     
         # I2C connection for BME280's
@@ -755,11 +853,9 @@ class Humidor:
         self._internal = ADC(4)
         
         self._fan_breakpoints = [
-            (0, 0), # fan 0 PWM is about 1/4 speed (820 RPM)
-            (1, 0),
-            (10, 25),
-            (50, 50),
-            (100, 100),
+            (30, FAN_LOW_PWM),
+            (60, FAN_MED_PWM),
+            (100, FAN_HIGH_PWM),
             ]
 
         Pin(PIN_FAN_TACH, Pin.IN, Pin.PULL_UP)       
@@ -833,7 +929,6 @@ class Humidor:
         recip_K = steinhart_hart(r2, a, b, c)
         degC = 1/recip_K - 273.15
 
-#         logit(f"{adc=}, {reading=}, {degC=}")
         return degC
     
     def read_internal(self):
@@ -860,7 +955,7 @@ class Humidor:
         return duty_cycle * 100
     
     def set_fan(self, percent):
-        percent = max(0, min(99.9, percent))
+        percent = max(0, min(100., percent))
         if percent > 0:
             self.fan_en.on()
         else:
@@ -880,7 +975,7 @@ class Humidor:
         self._set_pwm(self.pwm_heat, percent)
         
     def _set_pwm(self, pwm, percent):
-        percent = max(0, min(99.9, percent))
+        percent = max(0, min(100., percent))
         duty_cycle = int(655.35*percent)
         pwm.duty_u16(duty_cycle)
         
@@ -981,6 +1076,180 @@ class FanTachometer:
         except asyncio.CancelledError:
             self.counter.stop()
             
+            
+class Clock:
+    def __init__(self, debug=False):
+        self._seconds = 0
+        self._t0 = time.ticks_ms()
+        self._fh_log = None
+        self._log_init()
+        self._fh_console = sys.stderr
+        self.debug = debug
+        
+    async def sleep(self, sec):
+        delay_ms = int(sec*1000)
+#         logit(f"{delay_ms=}")
+        await asyncio.sleep_ms(delay_ms)
+        
+    def time(self):
+        t1 = time.ticks_ms()
+        dt = time.ticks_diff(t1, self._t0)
+        self._seconds += dt/1000.
+        self._t0 = t1
+        
+        return self._seconds
+    
+    def _log_init(self):
+        
+        # ==========
+        # setup a logging file (logit calls only go to console until this completes)
+        # ==========
+        try:
+            fn_cnt = len([fn for fn in os.listdir(LOGGING_DIR) if fn.startswith(LOGGING_START)])
+            self.logit(f"found {fn_cnt} existing log files")
+            if fn_cnt >= MAX_LOG_CNT:
+                # delete the oldest file
+                fn = LOGGING_DIR+LOGGING_FMT.format(fn_cnt-1)
+                self.logit(f"removing old log {fn}")
+                os.remove(fn)
+                fn_cnt -= 1
+                
+            for ii in range(fn_cnt):
+                fn_src = LOGGING_DIR+LOGGING_FMT.format(fn_cnt - 1 - ii)
+                fn_dst = LOGGING_DIR+LOGGING_FMT.format(fn_cnt - ii)
+                self.logit(f"renaming {fn_src} -> {fn_dst}")
+                os.rename(fn_src, fn_dst)
+
+            fn = LOGGING_DIR+LOGGING_FMT.format(0)
+            self._fh_log = open(fn, "w")
+            self.logit(f"opened {fn} for logging")
+
+        except Exception:
+            pass   # keep going, even if logging setup doesn't work
+    
+    def logit(self, msg):
+        """print a log message to the log file and optionally to the console, when available"""
+        
+        t = self.time()
+        msg = f"{t:8.3f}: {msg}"
+        if self._fh_log is not None:
+            if isinstance(self._fh_log, str):
+                with open(file, "a") as fh:
+                    print(msg, file=fh)
+            else:
+                print(msg, file=self._fh_log)
+                
+        if self.debug:
+            print(msg, file=self._fh_console)
+        
+    def close(self):
+        if self._fh_log is not None:
+            self._fh_log.close()
+
+class StatusMonitor:
+
+    agents = "clock humidor controller mqtt_monitor console_monitor".split()
+    
+    def __init__(self):
+        pass
+
+    def register(self, name, value):
+        if name in self.agents:
+            setattr(self, name, value)
+        else:
+            raise ValueError(f"'{name}' is not a recognized agent")
+            
+    async def status(self, full=False):
+        dd = {}
+        if hasattr(self, "controller"):
+            mode = self.controller.mode
+            fan_mode = self.controller.fan_mode
+            setpoint = self.controller.setpoint
+            heat_upper_limit_pwm = self.controller.heat_upper_limit_pwm
+        else:
+            mode, fan_mode, setpoint, heat_upper_limit_pwm = None, None, "", ""
+            
+        if hasattr(self, "humidor"):
+            humidor = self.humidor
+            Tin, RHin = humidor.get_inside()
+            Tout, RHout = humidor.get_outside()
+            heat_pwm, fan_pwm = humidor.get_heat(), humidor.get_fan()
+            Ths = humidor.get_heatsink()
+            fan_rpm = await humidor.get_rpm()
+        else:
+            Tin, Tout, RHin, RHout, Ths = [""]*5
+            heat_pwm, fan_pwm, fan_rpm = [""]*3
+            
+        dd = dict(
+            mode=mode, fan_mode=fan_mode, setpoint=setpoint,
+            in_temp=Tin, in_humid=RHin, out_temp=Tout, out_humid=RHout,
+            heat_pwm=heat_pwm, fan_pwm=fan_pwm, fan_rpm=fan_rpm,
+            heatsink_temp=Ths, heat_upper_limit_pwm=heat_upper_limit_pwm,
+            )
+        
+        if full and hasattr(self, "controller"):
+            # return internal state data, also
+            ctrl = self.controller
+            
+            for kk in ClimateController.defaults:
+                vv = getattr(ctrl, "_"+kk)
+                dd[kk] = vv
+                
+        return dd
+        
+        
+class ConsoleMonitor:
+    
+    def __init__(self, stat_mon, update_interval, update_offset):
+        self._sm = stat_mon
+        self._sm.register("console_monitor", self)
+        
+        self._update_interval = update_interval
+        self._update_offset = update_offset
+        
+    async def monitor(self):
+        
+        clock = self._sm.clock
+        humidor = self._sm.humidor
+        ctrl = self._sm.controller
+        
+        next_report_time = 3. #self._update_interval
+        current_time = clock.time()
+        while next_report_time < current_time:
+            next_report_time += 3 #self._update_interval
+            
+        dt = next_report_time - current_time + self._update_offset
+        await clock.sleep(dt)
+        
+        while True:
+            ss = await self._sm.status()
+            
+            keys = (
+                "setpoint heat_pwm fan_pwm in_temp in_humid out_temp out_humid"
+                " fan_rpm heatsink_temp").split()
+            fmts = [
+                "{:6.2f}C", "{:5.1f}%", "{:5.1f}%", "{:6.2f}C", "{:5.1f}%", "{:6.2f}C", "{:5.1f}%",
+                "{:4.0f} RPM", "{:6.2f}C"
+                ]
+            for kk, fmt in zip(keys, fmts):
+                val = ss[kk]
+                if val is not None and val is not "":
+#                     print(f"{kk=}, {fmt=}, {val=}")
+                    ss[kk] = fmt.format(val)
+                else:
+                    ss[kk] = "?"
+                
+            clock.logit(f"Tset= {ss['setpoint']}, Heat={ss['heat_pwm']}, Fan={ss['fan_pwm']}, {ss['fan_rpm']}")
+            clock.logit(f" Tin= {ss['in_temp']}, RHin= {ss['in_humid']}")
+            clock.logit(f" Tout={ss['out_temp']}, RHout={ss['out_humid']}")
+            clock.logit(f" Ths= {ss['heatsink_temp']}")
+            
+            # wait for the next reporting time, making sure we
+            #  aren't so late as to have missed one
+            current_time = clock.time()
+            while next_report_time < current_time:
+                next_report_time += self._update_interval
+            await clock.sleep(next_report_time - current_time + self._update_offset)
             
     
 if __name__ == "__main__":
